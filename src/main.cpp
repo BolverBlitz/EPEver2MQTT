@@ -39,6 +39,7 @@ unsigned long mqtttimer = 0;
 unsigned long RestartTimer = 0;
 unsigned long notifyTimer = 0;
 unsigned long slowDownTimer = 0;
+unsigned long autoChargerTimer = 0;
 byte ReqDevAddr = 1;
 char mqtt_server[80];
 char mqttClientId[80];
@@ -59,6 +60,16 @@ ModbusMaster epnode; // instantiate ModbusMaster object
 UnixTime uTime(3);
 
 JsonDocument liveJson;
+
+enum AutoChargerProfile : uint8_t
+{
+  AUTO_PROFILE_UNKNOWN = 0,
+  AUTO_PROFILE_LOW = 1,
+  AUTO_PROFILE_FULL = 2
+};
+
+uint8_t autoChargerAppliedProfile[MAX_DEVICES] = {AUTO_PROFILE_UNKNOWN};
+unsigned long autoChargerLastAttempt[MAX_DEVICES] = {0};
 
 OneWire oneWire(TEMPSENS_PIN);
 DallasTemperature tempSens(&oneWire);
@@ -319,6 +330,224 @@ bool parseMpptSetting(AsyncWebServerRequest *request, uint8_t index, uint16_t sc
   return true;
 }
 
+bool validateMpptProfile(const uint16_t *values, String &message)
+{
+  if (values[0] > 3)
+  {
+    message = "E1 must be between 0 and 3";
+    return false;
+  }
+  if (!(values[3] > values[4] && values[4] > values[6] && values[6] > values[7] &&
+        values[7] > values[8] && values[8] > values[9]))
+  {
+    message = "Required: E4 > E5 > E7 > E8 > E9 > E10";
+    return false;
+  }
+  if (!(values[11] > values[12] && values[12] > values[13] && values[13] > values[14]))
+  {
+    message = "Required: E12 > E13 > E14 > E15";
+    return false;
+  }
+  if (values[3] <= values[5])
+  {
+    message = "Required: E4 > E6";
+    return false;
+  }
+  if (values[10] <= values[13])
+  {
+    message = "Required: E11 > E14";
+    return false;
+  }
+  return true;
+}
+
+bool parseNumber(const String &input, double minimum, double maximum, double &value)
+{
+  char *end = nullptr;
+  value = strtod(input.c_str(), &end);
+  return input.length() > 0 && end != input.c_str() && *end == '\0' &&
+         isfinite(value) && value >= minimum && value <= maximum;
+}
+
+bool parseAutoChargerProfile(AsyncWebServerRequest *request, const String &prefix, uint16_t *values,
+                             String &message)
+{
+  for (uint8_t index = 0; index < DEVICE_SETTINGS_CNT; index++)
+  {
+    String name = prefix + "_e" + String(index + 1);
+    if (!request->hasParam(name, true))
+    {
+      message = name + " is missing";
+      return false;
+    }
+
+    double parsed;
+    double maximum = index == 0 ? 3.0 : (index == 2 ? 9.0 : (index == 1 ? 65535.0 : 655.35));
+    if (!parseNumber(request->getParam(name, true)->value(), 0, maximum, parsed))
+    {
+      message = name + " contains an invalid value";
+      return false;
+    }
+
+    double scaled = parsed * (index < 2 ? 1.0 : 100.0);
+    double rounded = round(scaled);
+    if (scaled > UINT16_MAX || fabs(scaled - rounded) > 0.001)
+    {
+      message = name + " contains too many decimal places";
+      return false;
+    }
+    values[index] = (uint16_t)rounded;
+  }
+
+  return validateMpptProfile(values, message);
+}
+
+int64_t daysFromCivil(int year, unsigned int month, unsigned int day)
+{
+  year -= month <= 2;
+  const int era = (year >= 0 ? year : year - 399) / 400;
+  const unsigned int yearOfEra = (unsigned int)(year - era * 400);
+  const unsigned int adjustedMonth = month > 2 ? month - 3 : month + 9;
+  const unsigned int dayOfYear = (153 * adjustedMonth + 2) / 5 + day - 1;
+  const unsigned int dayOfEra =
+      yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear;
+  return (int64_t)era * 146097 + (int64_t)dayOfEra - 719468;
+}
+
+struct SolarTimes
+{
+  bool valid;
+  time_t sunrise;
+  time_t solarNoon;
+  time_t sunset;
+};
+
+SolarTimes calculateSolarTimes(time_t now)
+{
+  SolarTimes times = {false, 0, 0, 0};
+  if (!_settings.data.autoChargerCoordinatesSet || now < 1577836800)
+    return times;
+
+  // Mean solar time gives the correct calendar date without requiring a configured POSIX timezone.
+  time_t solarLocalNow = now + (time_t)round(_settings.data.autoChargerLongitude * 240.0);
+  struct tm solarDate;
+  gmtime_r(&solarLocalNow, &solarDate);
+
+  const double pi = 3.14159265358979323846;
+  const double latitudeRadians = _settings.data.autoChargerLatitude * pi / 180.0;
+  const double gamma = 2.0 * pi / 365.0 * (solarDate.tm_yday + 0.5);
+  const double equationOfTime = 229.18 *
+                                (0.000075 + 0.001868 * cos(gamma) - 0.032077 * sin(gamma) -
+                                 0.014615 * cos(2.0 * gamma) - 0.040849 * sin(2.0 * gamma));
+  const double declination = 0.006918 - 0.399912 * cos(gamma) + 0.070257 * sin(gamma) -
+                             0.006758 * cos(2.0 * gamma) + 0.000907 * sin(2.0 * gamma) -
+                             0.002697 * cos(3.0 * gamma) + 0.00148 * sin(3.0 * gamma);
+  const double zenith = 90.833 * pi / 180.0;
+  const double hourAngleCos =
+      (cos(zenith) / (cos(latitudeRadians) * cos(declination))) -
+      tan(latitudeRadians) * tan(declination);
+  if (hourAngleCos < -1.0 || hourAngleCos > 1.0)
+    return times;
+
+  const double hourAngleDegrees = acos(hourAngleCos) * 180.0 / pi;
+  const double solarNoonMinutes =
+      720.0 - 4.0 * _settings.data.autoChargerLongitude - equationOfTime;
+  const double sunriseMinutes = solarNoonMinutes - 4.0 * hourAngleDegrees;
+  const double sunsetMinutes = solarNoonMinutes + 4.0 * hourAngleDegrees;
+  const time_t utcMidnight =
+      (time_t)(daysFromCivil(solarDate.tm_year + 1900, solarDate.tm_mon + 1, solarDate.tm_mday) * 86400LL);
+
+  times.valid = true;
+  times.sunrise = utcMidnight + (time_t)round(sunriseMinutes * 60.0);
+  times.solarNoon = utcMidnight + (time_t)round(solarNoonMinutes * 60.0);
+  times.sunset = utcMidnight + (time_t)round(sunsetMinutes * 60.0);
+  return times;
+}
+
+time_t autoChargerReleaseTime(const SolarTimes &solar, uint8_t releasePercent)
+{
+  const time_t daylight = solar.sunset - solar.sunrise;
+  return solar.sunrise + (time_t)((int64_t)daylight * releasePercent / 100);
+}
+
+void resetAutoChargerRuntime()
+{
+  for (uint8_t device = 0; device < MAX_DEVICES; device++)
+  {
+    autoChargerAppliedProfile[device] = AUTO_PROFILE_UNKNOWN;
+    autoChargerLastAttempt[device] = 0;
+  }
+  autoChargerTimer = 0;
+}
+
+void runAutoCharger()
+{
+  if (!_settings.data.autoChargerEnabled ||
+      !_settings.data.autoChargerLowProfileSet ||
+      !_settings.data.autoChargerFullProfileSet ||
+      millis() - autoChargerTimer < 30000)
+    return;
+  autoChargerTimer = millis();
+
+  time_t now;
+  time(&now);
+  SolarTimes solar = calculateSolarTimes(now);
+  if (!solar.valid)
+    return;
+
+  const time_t lowChargeTime = solar.sunrise - 3600;
+  for (uint8_t device = 1; device <= _settings.data.deviceQuantity && device <= MAX_DEVICES; device++)
+  {
+    uint8_t index = device - 1;
+    if (!_settings.data.autoChargerMpptEnabled[index])
+      continue;
+
+    time_t fullChargeTime =
+        autoChargerReleaseTime(solar, _settings.data.autoChargerReleasePercent[index]);
+    uint8_t desiredProfile =
+        now >= lowChargeTime && now < fullChargeTime ? AUTO_PROFILE_LOW : AUTO_PROFILE_FULL;
+    if (autoChargerAppliedProfile[index] == desiredProfile)
+      continue;
+    if (autoChargerLastAttempt[index] != 0 && millis() - autoChargerLastAttempt[index] < 300000)
+      continue;
+    autoChargerLastAttempt[index] = millis();
+
+    const uint16_t *profile = desiredProfile == AUTO_PROFILE_LOW
+                                  ? _settings.data.autoChargerLowProfile
+                                  : _settings.data.autoChargerFullProfile;
+    uint16_t currentValues[DEVICE_SETTINGS_CNT];
+    uint16_t readBack[DEVICE_SETTINGS_CNT];
+    uint16_t previousTimeout = epnode.getResponseTimeout();
+    epnode.setResponseTimeout(500);
+    uint8_t readStatus = readMpptSettings(device, currentValues);
+    epnode.setResponseTimeout(previousTimeout);
+
+    if (readStatus == epnode.ku8MBSuccess && mpptSettingsMatch(profile, currentValues))
+    {
+      autoChargerAppliedProfile[index] = desiredProfile;
+      updateMpptSettingsJson(device, currentValues);
+      continue;
+    }
+
+    uint8_t writeStatus;
+    uint8_t verifyReadStatus;
+    uint8_t verifyStatus =
+        writeAndVerifyMpptSettings(device, profile, readBack, writeStatus, verifyReadStatus);
+    if (verifyStatus == 0)
+    {
+      autoChargerAppliedProfile[index] = desiredProfile;
+      updateMpptSettingsJson(device, readBack);
+      mqtttimer = 0;
+      DEBUG_WEBLN("AUTO CHARGER device " + String(device) +
+                  (desiredProfile == AUTO_PROFILE_LOW ? " set to LowCharge" : " set to FullCharge"));
+    }
+    else
+    {
+      DEBUG_WEBLN("AUTO CHARGER device " + String(device) + " profile write failed");
+    }
+  }
+}
+
 void setup()
 {
   _settings.load();
@@ -338,9 +567,11 @@ void setup()
   wm.setSaveConfigCallback(saveConfigCallback);
 
   // https://werner.rothschopf.net/202011_arduino_esp8266_ntp_en.htm
-  if (strlen(_settings.data.NTPTimezone) != 0 && strlen(_settings.data.NTPServer) != 0)
+  if (strlen(_settings.data.NTPServer) != 0 &&
+      (strlen(_settings.data.NTPTimezone) != 0 || _settings.data.autoChargerEnabled))
   {
-    configTime(_settings.data.NTPTimezone, _settings.data.NTPServer);
+    configTime(strlen(_settings.data.NTPTimezone) != 0 ? _settings.data.NTPTimezone : "UTC0",
+               _settings.data.NTPServer);
     settimeofday_cb(NTPTimeSetCB);
   }
 
@@ -482,6 +713,193 @@ void setup()
                 if(strlen(_settings.data.httpUser) > 0 && !request->authenticate(_settings.data.httpUser, _settings.data.httpPass)) return request->requestAuthentication();
                 AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html", HTML_MPPT_SETTINGS, htmlProcessor);
                 request->send(response); });
+
+    server.on("/autocharger", HTTP_GET, [](AsyncWebServerRequest *request)
+              {
+                if(strlen(_settings.data.httpUser) > 0 && !request->authenticate(_settings.data.httpUser, _settings.data.httpPass)) return request->requestAuthentication();
+                AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html", HTML_AUTO_CHARGER, htmlProcessor);
+                request->send(response); });
+
+    server.on("/autochargerjson", HTTP_GET, [](AsyncWebServerRequest *request)
+              {
+                if(strlen(_settings.data.httpUser) > 0 && !request->authenticate(_settings.data.httpUser, _settings.data.httpPass)) return request->requestAuthentication();
+                JsonDocument document;
+                document["enabled"] = _settings.data.autoChargerEnabled;
+                document["coordinatesSet"] = _settings.data.autoChargerCoordinatesSet;
+                document["lowProfileSet"] = _settings.data.autoChargerLowProfileSet == 1;
+                document["fullProfileSet"] = _settings.data.autoChargerFullProfileSet == 1;
+                document["latitude"] = String(_settings.data.autoChargerLatitude, 15);
+                document["longitude"] = String(_settings.data.autoChargerLongitude, 15);
+                document["deviceQuantity"] = _settings.data.deviceQuantity;
+
+                JsonArray lowProfile = document["lowProfile"].to<JsonArray>();
+                JsonArray fullProfile = document["fullProfile"].to<JsonArray>();
+                for (uint8_t index = 0; index < DEVICE_SETTINGS_CNT; index++)
+                {
+                  lowProfile.add(_settings.data.autoChargerLowProfile[index]);
+                  fullProfile.add(_settings.data.autoChargerFullProfile[index]);
+                }
+
+                JsonArray devices = document["devices"].to<JsonArray>();
+                for (uint8_t device = 1; device <= _settings.data.deviceQuantity && device <= MAX_DEVICES; device++)
+                {
+                  uint8_t index = device - 1;
+                  JsonObject deviceData = devices.add<JsonObject>();
+                  deviceData["device"] = device;
+                  deviceData["enabled"] = _settings.data.autoChargerMpptEnabled[index];
+                  deviceData["releasePercent"] = _settings.data.autoChargerReleasePercent[index];
+                  deviceData["releaseFraction"] =
+                      _settings.data.autoChargerReleasePercent[index] / 100.f;
+                  deviceData["activeProfile"] =
+                      autoChargerAppliedProfile[index] == AUTO_PROFILE_LOW
+                          ? "LowCharge"
+                          : (autoChargerAppliedProfile[index] == AUTO_PROFILE_FULL ? "FullCharge" : "Unknown");
+                }
+
+                time_t now;
+                time(&now);
+                document["now"] = (int64_t)now;
+                SolarTimes solar = calculateSolarTimes(now);
+                JsonObject today = document["today"].to<JsonObject>();
+                today["valid"] = solar.valid;
+                if (solar.valid)
+                {
+                  today["sunrise"] = (int64_t)solar.sunrise;
+                  today["solarNoon"] = (int64_t)solar.solarNoon;
+                  today["sunset"] = (int64_t)solar.sunset;
+                  today["lowCharge"] = (int64_t)(solar.sunrise - 3600);
+                  today["daylightSeconds"] = (int64_t)(solar.sunset - solar.sunrise);
+                  JsonArray releases = today["fullCharge"].to<JsonArray>();
+                  for (uint8_t device = 1; device <= _settings.data.deviceQuantity && device <= MAX_DEVICES; device++)
+                  {
+                    JsonObject release = releases.add<JsonObject>();
+                    release["device"] = device;
+                    release["time"] =
+                        (int64_t)autoChargerReleaseTime(solar, _settings.data.autoChargerReleasePercent[device - 1]);
+                  }
+                }
+
+                String body;
+                serializeJson(document, body);
+                request->send(200, "application/json", body);
+              });
+
+    server.on("/autochargerschedulesave", HTTP_POST, [](AsyncWebServerRequest *request)
+              {
+                if(strlen(_settings.data.httpUser) > 0 && !request->authenticate(_settings.data.httpUser, _settings.data.httpPass)) return request->requestAuthentication();
+                double latitude;
+                double longitude;
+                if (!request->hasParam("latitude", true) ||
+                    !parseNumber(request->getParam("latitude", true)->value(), -90, 90, latitude) ||
+                    !request->hasParam("longitude", true) ||
+                    !parseNumber(request->getParam("longitude", true)->value(), -180, 180, longitude))
+                {
+                  request->send(400, "application/json", "{\"ok\":false,\"message\":\"Latitude or longitude is invalid\"}");
+                  return;
+                }
+
+                bool enabledDevices[MAX_DEVICES] = {false};
+                uint8_t offsets[MAX_DEVICES] = {0};
+                bool anyDeviceEnabled = false;
+                for (uint8_t device = 1; device <= _settings.data.deviceQuantity && device <= MAX_DEVICES; device++)
+                {
+                  uint8_t index = device - 1;
+                  String enabledName = "device" + String(device) + "_enabled";
+                  String offsetName = "device" + String(device) + "_release";
+                  enabledDevices[index] = request->hasParam(enabledName, true);
+                  anyDeviceEnabled = anyDeviceEnabled || enabledDevices[index];
+
+                  double offset;
+                  if (!request->hasParam(offsetName, true) ||
+                      !parseNumber(request->getParam(offsetName, true)->value(), 0, 100, offset) ||
+                      fabs(offset - round(offset)) > 0.001)
+                  {
+                    request->send(400, "application/json",
+                                  "{\"ok\":false,\"message\":\"Each MPPT release point must be a whole daylight percentage from 0 to 100\"}");
+                    return;
+                  }
+                  offsets[index] = (uint8_t)round(offset);
+                }
+
+                bool autoEnabled = request->hasParam("enabled", true);
+                if (autoEnabled && !anyDeviceEnabled)
+                {
+                  request->send(400, "application/json",
+                                "{\"ok\":false,\"message\":\"Enable at least one MPPT before enabling AUTO CHARGER\"}");
+                  return;
+                }
+                if (autoEnabled &&
+                    (!_settings.data.autoChargerLowProfileSet || !_settings.data.autoChargerFullProfileSet))
+                {
+                  request->send(400, "application/json",
+                                "{\"ok\":false,\"message\":\"Save both LowCharge and FullCharge profiles before enabling AUTO CHARGER\"}");
+                  return;
+                }
+
+                _settings.data.autoChargerEnabled = autoEnabled;
+                _settings.data.autoChargerCoordinatesSet = true;
+                _settings.data.autoChargerLatitude = latitude;
+                _settings.data.autoChargerLongitude = longitude;
+                for (uint8_t index = 0; index < MAX_DEVICES; index++)
+                {
+                  _settings.data.autoChargerMpptEnabled[index] = enabledDevices[index];
+                  if (index < _settings.data.deviceQuantity)
+                    _settings.data.autoChargerReleasePercent[index] = offsets[index];
+                }
+                _settings.save();
+                if (autoEnabled && strlen(_settings.data.NTPServer) != 0)
+                {
+                  configTime(strlen(_settings.data.NTPTimezone) != 0 ? _settings.data.NTPTimezone : "UTC0",
+                             _settings.data.NTPServer);
+                  settimeofday_cb(NTPTimeSetCB);
+                }
+                resetAutoChargerRuntime();
+                request->send(200, "application/json",
+                              "{\"ok\":true,\"message\":\"Schedule and location saved\"}");
+              });
+
+    server.on("/autochargerprofilesave", HTTP_POST, [](AsyncWebServerRequest *request)
+              {
+                if(strlen(_settings.data.httpUser) > 0 && !request->authenticate(_settings.data.httpUser, _settings.data.httpPass)) return request->requestAuthentication();
+                String profileName = request->hasParam("profile", true)
+                                         ? request->getParam("profile", true)->value()
+                                         : "";
+                bool isLowProfile = profileName == "low";
+                bool isFullProfile = profileName == "full";
+                if (!isLowProfile && !isFullProfile)
+                {
+                  request->send(400, "application/json",
+                                "{\"ok\":false,\"message\":\"Invalid profile selection\"}");
+                  return;
+                }
+
+                uint16_t profile[DEVICE_SETTINGS_CNT];
+                String validationMessage;
+                if (!parseAutoChargerProfile(request, profileName, profile, validationMessage))
+                {
+                  String displayName = isLowProfile ? "LowCharge" : "FullCharge";
+                  String body = "{\"ok\":false,\"message\":\"" + displayName +
+                                " profile: " + validationMessage + "\"}";
+                  request->send(400, "application/json", body);
+                  return;
+                }
+
+                if (isLowProfile)
+                {
+                  memcpy(_settings.data.autoChargerLowProfile, profile, sizeof(profile));
+                  _settings.data.autoChargerLowProfileSet = 1;
+                }
+                else
+                {
+                  memcpy(_settings.data.autoChargerFullProfile, profile, sizeof(profile));
+                  _settings.data.autoChargerFullProfileSet = 1;
+                }
+                _settings.save();
+                resetAutoChargerRuntime();
+                String displayName = isLowProfile ? "LowCharge" : "FullCharge";
+                request->send(200, "application/json",
+                              "{\"ok\":true,\"message\":\"" + displayName + " profile saved\"}");
+              });
 
     server.on("/mpptsettingsjson", HTTP_GET, [](AsyncWebServerRequest *request)
               {
@@ -893,6 +1311,7 @@ bool epWorker()
     return true;
   }
   liveJson["Wifi_RSSI"] = WiFi.RSSI();
+  runAutoCharger();
 
   if (strlen(_settings.data.NTPTimezone) != 0 && setNTPTimeToDevice == true)
   {

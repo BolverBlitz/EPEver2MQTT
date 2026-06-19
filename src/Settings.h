@@ -4,6 +4,9 @@
 #include <EEPROM.h>
 
 #define EEPROM_SIZE 1024
+#define AUTO_CHARGER_SETTINGS_MAGIC 0xAC45
+#define AUTO_CHARGER_PROFILE_SIZE 15
+#define AUTO_CHARGER_MAX_DEVICES 6
 
 class Settings
 {
@@ -36,6 +39,17 @@ public:
     char staticGW[16];        // static gateway
     char staticSN[16];        // static subnet mask
     char staticDNS[16];       // static DNS
+    uint16_t autoChargerMagic;
+    bool autoChargerEnabled;
+    bool autoChargerCoordinatesSet;
+    double autoChargerLatitude;
+    double autoChargerLongitude;
+    uint16_t autoChargerLowProfile[AUTO_CHARGER_PROFILE_SIZE];
+    uint16_t autoChargerFullProfile[AUTO_CHARGER_PROFILE_SIZE];
+    bool autoChargerMpptEnabled[AUTO_CHARGER_MAX_DEVICES];
+    uint8_t autoChargerReleasePercent[AUTO_CHARGER_MAX_DEVICES];
+    uint8_t autoChargerLowProfileSet;
+    uint8_t autoChargerFullProfileSet;
    } data;
 
   void load()
@@ -152,6 +166,54 @@ private:
     if (strlen(data.staticDNS) == 0 || strlen(data.staticDNS) >= 16)
     {
       strcpy(data.staticDNS, "");
+    }
+    if (data.autoChargerMagic != AUTO_CHARGER_SETTINGS_MAGIC)
+    {
+      initializeAutoCharger();
+    }
+    if (!isfinite(data.autoChargerLatitude) || data.autoChargerLatitude < -90.0 || data.autoChargerLatitude > 90.0)
+    {
+      data.autoChargerLatitude = 0.0;
+    }
+    if (!isfinite(data.autoChargerLongitude) || data.autoChargerLongitude < -180.0 || data.autoChargerLongitude > 180.0)
+    {
+      data.autoChargerLongitude = 0.0;
+    }
+    for (uint8_t device = 0; device < AUTO_CHARGER_MAX_DEVICES; device++)
+    {
+      if (data.autoChargerReleasePercent[device] > 100)
+      {
+        data.autoChargerReleasePercent[device] = 60;
+      }
+    }
+    if (data.autoChargerLowProfileSet > 1)
+    {
+      data.autoChargerLowProfileSet = 0;
+    }
+    if (data.autoChargerFullProfileSet > 1)
+    {
+      data.autoChargerFullProfileSet = 0;
+    }
+    if (!data.autoChargerLowProfileSet || !data.autoChargerFullProfileSet)
+    {
+      data.autoChargerEnabled = false;
+    }
+  }
+  void initializeAutoCharger()
+  {
+    data.autoChargerMagic = AUTO_CHARGER_SETTINGS_MAGIC;
+    data.autoChargerEnabled = false;
+    data.autoChargerCoordinatesSet = false;
+    data.autoChargerLatitude = 0.0;
+    data.autoChargerLongitude = 0.0;
+    memset(data.autoChargerLowProfile, 0, sizeof(data.autoChargerLowProfile));
+    memset(data.autoChargerFullProfile, 0, sizeof(data.autoChargerFullProfile));
+    memset(data.autoChargerMpptEnabled, 0, sizeof(data.autoChargerMpptEnabled));
+    data.autoChargerLowProfileSet = 0;
+    data.autoChargerFullProfileSet = 0;
+    for (uint8_t device = 0; device < AUTO_CHARGER_MAX_DEVICES; device++)
+    {
+      data.autoChargerReleasePercent[device] = 60;
     }
   }
   void coVersCheck()

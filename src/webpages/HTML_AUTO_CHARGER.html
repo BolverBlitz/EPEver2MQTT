@@ -1,0 +1,446 @@
+%pre_head_template%
+<figure class="text-center">
+  <h1>AUTO Charger</h1>
+  <p class="text-body-secondary">Daylight-based charge scheduling</p>
+</figure>
+
+<div id="status" class="alert alert-info" role="alert">Loading AUTO Charger settings...</div>
+<div id="coordinateWarning" class="alert alert-warning" role="alert" style="display:none">
+  Latitude and longitude are required before sunrise, solar noon, sunset, or profile switch times can be calculated.
+</div>
+
+<form id="autoChargerForm">
+  <div class="input-group mb-2">
+    <span class="input-group-text w-50">AUTO Charger</span>
+    <div class="form-switch form-control" style="text-align:center">
+      <input class="form-check-input" type="checkbox" role="switch" id="enabled" name="enabled">
+    </div>
+  </div>
+  <div class="input-group mb-2">
+    <label class="input-group-text w-50" for="latitude">Latitude</label>
+    <input class="form-control" type="number" id="latitude" name="latitude" min="-90" max="90" step="any" required>
+  </div>
+  <div class="input-group mb-3">
+    <label class="input-group-text w-50" for="longitude">Longitude</label>
+    <input class="form-control" type="number" id="longitude" name="longitude" min="-180" max="180" step="any" required>
+  </div>
+
+  <div class="card mb-3">
+    <div class="card-body">
+      <h5 class="card-title text-center" id="todayTitle">Today</h5>
+      <div id="sunDial" class="mb-2">
+        <svg viewBox="0 0 200 125" width="100%%" role="img" aria-label="Today's daylight schedule">
+          <defs>
+            <linearGradient id="daylightGradient" x1="0" x2="1">
+              <stop offset="0" stop-color="#f6ad55"/>
+              <stop offset="0.5" stop-color="#ffd43b"/>
+              <stop offset="1" stop-color="#f6ad55"/>
+            </linearGradient>
+          </defs>
+          <path d="M20 95 A80 70 0 0 1 180 95" fill="none" stroke="var(--bs-secondary-bg)" stroke-width="12" stroke-linecap="round"/>
+          <path d="M20 95 A80 70 0 0 1 180 95" fill="none" stroke="url(#daylightGradient)" stroke-width="8" stroke-linecap="round"/>
+          <circle cx="100" cy="25" r="8" fill="#ffd43b"/>
+          <g id="releaseMarkers"></g>
+          <text x="20" y="116" text-anchor="middle" font-size="9" fill="currentColor" id="sunrise">--:--</text>
+          <text x="100" y="16" text-anchor="middle" font-size="9" fill="currentColor" id="solarNoon">--:--</text>
+          <text x="180" y="116" text-anchor="middle" font-size="9" fill="currentColor" id="sunset">--:--</text>
+        </svg>
+      </div>
+      <div class="row small mb-1"><div class="col-6">LowCharge</div><div class="col-6 text-end" id="lowChargeTime">--:--</div></div>
+      <div id="fullChargeTimes"></div>
+      <div class="text-body-secondary small text-center mt-2" id="daylightLength"></div>
+    </div>
+  </div>
+
+  <div class="card mb-3">
+    <div class="card-body">
+      <h5 class="card-title">MPPT schedule</h5>
+      <p class="small">
+        Release point is measured through today's daylight: 50%% is solar noon, values below 50%%
+        switch before solar noon, and values above 50%% switch after it. For example, 60%% is
+        48 minutes after solar noon on an 8-hour day and 96 minutes after it on a 16-hour day.
+      </p>
+      <div id="devices"></div>
+    </div>
+  </div>
+
+  <div class="d-grid mb-3">
+    <button class="btn btn-primary" id="saveScheduleButton" type="button" disabled>Save Schedule &amp; Location</button>
+  </div>
+
+  <div class="input-group mb-3">
+    <label class="input-group-text" for="profileSource">Import from</label>
+    <select class="form-select" id="profileSource"></select>
+  </div>
+
+  <ul class="nav nav-tabs mb-3" role="tablist">
+    <li class="nav-item" role="presentation">
+      <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#lowProfilePane" type="button">LowCharge</button>
+    </li>
+    <li class="nav-item" role="presentation">
+      <button class="nav-link" data-bs-toggle="tab" data-bs-target="#fullProfilePane" type="button">FullCharge</button>
+    </li>
+  </ul>
+  <div class="tab-content mb-3">
+    <div class="tab-pane fade show active" id="lowProfilePane">
+      <div class="alert alert-secondary py-2 small" id="lowProfileStatus">LowCharge profile not saved</div>
+      <div id="lowFields"></div>
+      <div class="d-grid gap-2">
+        <button class="btn btn-outline-secondary profile-import" id="importLowButton" type="button" disabled>Import Current Settings</button>
+        <button class="btn btn-primary profile-save" id="saveLowButton" type="button" disabled>Save LowCharge Profile</button>
+      </div>
+    </div>
+    <div class="tab-pane fade" id="fullProfilePane">
+      <div class="alert alert-secondary py-2 small" id="fullProfileStatus">FullCharge profile not saved</div>
+      <div id="fullFields"></div>
+      <div class="d-grid gap-2">
+        <button class="btn btn-outline-secondary profile-import" id="importFullButton" type="button" disabled>Import Current Settings</button>
+        <button class="btn btn-primary profile-save" id="saveFullButton" type="button" disabled>Save FullCharge Profile</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="alert alert-warning small" role="alert">
+    AUTO Charger writes all E1-E15 registers. Verify both profiles against the battery manufacturer's limits.
+    Accurate system time from NTP is required.
+  </div>
+
+  <div class="d-grid gap-2">
+    <a class="btn btn-primary" href="/settings" role="button">Back</a>
+  </div>
+</form>
+
+<script>
+  const definitions = [
+    { label: 'E1 Battery type', unit: '', type: 'select' },
+    { label: 'E2 Battery capacity', unit: 'Ah', step: '1' },
+    { label: 'E3 Temperature compensation', unit: 'mV/C/2V', step: '0.01', max: '9' },
+    { label: 'E4 High voltage disconnect', unit: 'V', step: '0.01' },
+    { label: 'E5 Charging limit voltage', unit: 'V', step: '0.01' },
+    { label: 'E6 Over voltage reconnect', unit: 'V', step: '0.01' },
+    { label: 'E7 Equalization voltage', unit: 'V', step: '0.01' },
+    { label: 'E8 Boost voltage', unit: 'V', step: '0.01' },
+    { label: 'E9 Float voltage', unit: 'V', step: '0.01' },
+    { label: 'E10 Boost reconnect voltage', unit: 'V', step: '0.01' },
+    { label: 'E11 Low voltage reconnect', unit: 'V', step: '0.01' },
+    { label: 'E12 Under voltage recover', unit: 'V', step: '0.01' },
+    { label: 'E13 Under voltage warning', unit: 'V', step: '0.01' },
+    { label: 'E14 Low voltage disconnect', unit: 'V', step: '0.01' },
+    { label: 'E15 Discharging limit voltage', unit: 'V', step: '0.01' }
+  ];
+
+  const form = document.getElementById('autoChargerForm');
+  const saveScheduleButton = document.getElementById('saveScheduleButton');
+  const saveLowButton = document.getElementById('saveLowButton');
+  const saveFullButton = document.getElementById('saveFullButton');
+  const importLowButton = document.getElementById('importLowButton');
+  const importFullButton = document.getElementById('importFullButton');
+  const profileSource = document.getElementById('profileSource');
+  const statusBox = document.getElementById('status');
+  let loading = false;
+
+  function buildProfile(prefix, targetId) {
+    const target = document.getElementById(targetId);
+    definitions.forEach((definition, index) => {
+      const group = document.createElement('div');
+      group.className = 'input-group mb-2';
+      const label = document.createElement('label');
+      label.className = 'input-group-text w-50';
+      label.htmlFor = prefix + '_e' + (index + 1);
+      label.textContent = definition.label;
+      group.appendChild(label);
+
+      let input;
+      if (definition.type === 'select') {
+        input = document.createElement('select');
+        ['User', 'Sealed', 'GEL', 'Flooded'].forEach((name, value) => input.add(new Option(value + ' - ' + name, value)));
+      } else {
+        input = document.createElement('input');
+        input.type = 'number';
+        input.min = '0';
+        input.max = definition.max || (definition.step === '1' ? '65535' : '655.35');
+        input.step = definition.step;
+        input.required = true;
+      }
+      input.className = 'form-control';
+      input.id = prefix + '_e' + (index + 1);
+      input.name = input.id;
+      group.appendChild(input);
+
+      if (definition.unit) {
+        const unit = document.createElement('span');
+        unit.className = 'input-group-text';
+        unit.textContent = definition.unit;
+        group.appendChild(unit);
+      }
+      target.appendChild(group);
+    });
+  }
+
+  function showStatus(message, style) {
+    statusBox.className = 'alert alert-' + style;
+    statusBox.textContent = message;
+  }
+
+  function formatTime(epoch) {
+    if (!epoch) return '--:--';
+    const date = new Date(epoch * 1000);
+    const hours = String(date.getHours()).padStart(2, '0');
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    return hours + ':' + minutes;
+  }
+
+  function formatDate(epoch) {
+    return epoch ? new Date(epoch * 1000).toLocaleDateString() : '';
+  }
+
+  function formatDuration(seconds) {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.round((seconds - hours * 3600) / 60);
+    return hours + 'h ' + minutes + 'm daylight';
+  }
+
+  function populateProfile(prefix, values, configured) {
+    values.forEach((raw, index) => {
+      const input = document.getElementById(prefix + '_e' + (index + 1));
+      input.value = !configured && index > 0 ? '' : (index < 2 ? raw : (raw / 100).toFixed(2));
+    });
+  }
+
+  function setProfileStatus(prefix, configured) {
+    const box = document.getElementById(prefix + 'ProfileStatus');
+    const name = prefix === 'low' ? 'LowCharge' : 'FullCharge';
+    box.className = 'alert py-2 small alert-' + (configured ? 'success' : 'secondary');
+    box.textContent = name + (configured ? ' profile saved' : ' profile not saved');
+  }
+
+  function setButtonsDisabled(disabled) {
+    saveScheduleButton.disabled = disabled;
+    saveLowButton.disabled = disabled;
+    saveFullButton.disabled = disabled;
+    importLowButton.disabled = disabled;
+    importFullButton.disabled = disabled;
+    profileSource.disabled = disabled;
+  }
+
+  function populateProfileSources(deviceQuantity) {
+    const selected = profileSource.value || '1';
+    profileSource.innerHTML = '';
+    for (let device = 1; device <= deviceQuantity; device++) {
+      profileSource.add(new Option('MPPT ' + device, device));
+    }
+    if (Number(selected) <= deviceQuantity) profileSource.value = selected;
+  }
+
+  function renderDevices(data) {
+    const target = document.getElementById('devices');
+    target.innerHTML = '';
+    data.devices.forEach(device => {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'border rounded p-2 mb-2';
+      wrapper.innerHTML =
+        '<div class="form-check form-switch mb-2">' +
+        '<input class="form-check-input" type="checkbox" role="switch" id="device' + device.device + '_enabled" ' +
+        'name="device' + device.device + '_enabled"' + (device.enabled ? ' checked' : '') + '>' +
+        '<label class="form-check-label" for="device' + device.device + '_enabled">Enable MPPT ' + device.device + '</label></div>' +
+        '<div class="input-group">' +
+        '<label class="input-group-text" for="device' + device.device + '_release">FullCharge point</label>' +
+        '<input class="form-control release-input" type="number" min="0" max="100" step="1" required ' +
+        'id="device' + device.device + '_release" name="device' + device.device + '_release" value="' + device.releasePercent + '">' +
+        '<span class="input-group-text">%% through daylight</span></div>' +
+        '<div class="small text-body-secondary mt-1">Release fraction: <span id="device' + device.device +
+        '_fraction">' + device.releaseFraction.toFixed(2) + '</span>; active profile: ' + device.activeProfile + '</div>';
+      target.appendChild(wrapper);
+      wrapper.querySelector('.release-input').addEventListener('input', event => {
+        const value = Number(event.target.value);
+        document.getElementById('device' + device.device + '_fraction').textContent =
+          Number.isFinite(value) ? (value / 100).toFixed(2) : '-';
+      });
+    });
+  }
+
+  function renderToday(data) {
+    const coordinateWarning = document.getElementById('coordinateWarning');
+    coordinateWarning.style.display = data.coordinatesSet ? 'none' : '';
+    document.getElementById('todayTitle').textContent =
+      data.today.valid ? 'Today: ' + formatDate(data.today.sunrise) : 'Today';
+
+    if (!data.today.valid) {
+      ['sunrise', 'solarNoon', 'sunset', 'lowChargeTime'].forEach(id => document.getElementById(id).textContent = '--:--');
+      document.getElementById('fullChargeTimes').innerHTML =
+        '<div class="text-warning small text-center">Solar times unavailable.</div>';
+      document.getElementById('daylightLength').textContent = '';
+      document.getElementById('releaseMarkers').innerHTML = '';
+      return;
+    }
+    document.getElementById('sunrise').textContent = formatTime(data.today.sunrise);
+    document.getElementById('solarNoon').textContent = formatTime(data.today.solarNoon);
+    document.getElementById('sunset').textContent = formatTime(data.today.sunset);
+    document.getElementById('lowChargeTime').textContent = formatTime(data.today.lowCharge);
+    document.getElementById('daylightLength').textContent = formatDuration(data.today.daylightSeconds);
+    const releases = document.getElementById('fullChargeTimes');
+    const markers = document.getElementById('releaseMarkers');
+    releases.innerHTML = '';
+    markers.innerHTML = '';
+    const colors = ['#dc3545', '#0d6efd', '#198754', '#6f42c1', '#fd7e14', '#20c997'];
+    data.today.fullCharge.forEach((item, index) => {
+      const device = data.devices.find(entry => entry.device === item.device);
+      if (!device || !device.enabled) return;
+      const color = colors[index - colors.length * Math.floor(index / colors.length)];
+      const row = document.createElement('div');
+      row.className = 'row small mb-1';
+      row.innerHTML = '<div class="col-7"><span style="color:' + color +
+        ';font-size:1.5em;line-height:0;vertical-align:-0.08em">&bull;</span> ' +
+        item.device + ' FullCharge</div><div class="col-5 text-end">' + formatTime(item.time) + '</div>';
+      releases.appendChild(row);
+
+      const fraction = Math.max(0, Math.min(1, device.releasePercent / 100));
+      const angle = Math.PI - Math.PI * fraction;
+      const x = 100 + 80 * Math.cos(angle);
+      const y = 95 - 70 * Math.sin(angle);
+      const outwardX = Math.cos(angle);
+      const outwardY = -Math.sin(angle);
+      const tangentX = Math.sin(angle);
+      const tangentY = Math.cos(angle);
+      const baseX = x + outwardX * 7;
+      const baseY = y + outwardY * 7;
+
+      const chevron = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+      chevron.setAttribute('points',
+        (baseX + tangentX * 3).toFixed(1) + ',' + (baseY + tangentY * 3).toFixed(1) + ' ' +
+        x.toFixed(1) + ',' + y.toFixed(1) + ' ' +
+        (baseX - tangentX * 3).toFixed(1) + ',' + (baseY - tangentY * 3).toFixed(1));
+      chevron.setAttribute('fill', 'none');
+      chevron.setAttribute('stroke', color);
+      chevron.setAttribute('stroke-width', '2');
+      chevron.setAttribute('stroke-linecap', 'round');
+      chevron.setAttribute('stroke-linejoin', 'round');
+      markers.appendChild(chevron);
+    });
+  }
+
+  async function loadSettings(quiet) {
+    if (loading) return;
+    loading = true;
+    if (!quiet) showStatus('Loading AUTO CHARGER settings...', 'info');
+    try {
+      const response = await fetch('/autochargerjson', { cache: 'no-store' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || 'Unable to load AUTO CHARGER settings');
+      document.getElementById('enabled').checked = data.enabled;
+      document.getElementById('latitude').value = data.coordinatesSet ? data.latitude : '';
+      document.getElementById('longitude').value = data.coordinatesSet ? data.longitude : '';
+      populateProfile('low', data.lowProfile, data.lowProfileSet);
+      populateProfile('full', data.fullProfile, data.fullProfileSet);
+      setProfileStatus('low', data.lowProfileSet);
+      setProfileStatus('full', data.fullProfileSet);
+      populateProfileSources(data.deviceQuantity);
+      renderDevices(data);
+      renderToday(data);
+      setButtonsDisabled(false);
+      if (!quiet) showStatus('AUTO CHARGER settings loaded', 'success');
+    } catch (error) {
+      showStatus(error.message, 'danger');
+    } finally {
+      loading = false;
+    }
+  }
+
+  function validInputs(inputs) {
+    const invalid = inputs.find(input => !input.checkValidity());
+    if (!invalid) return true;
+    invalid.reportValidity();
+    return false;
+  }
+
+  saveScheduleButton.addEventListener('click', async () => {
+    const scheduleInputs = [
+      document.getElementById('latitude'),
+      document.getElementById('longitude'),
+      ...Array.from(document.querySelectorAll('.release-input'))
+    ];
+    if (!validInputs(scheduleInputs)) return;
+
+    const formData = new FormData();
+    if (document.getElementById('enabled').checked) formData.append('enabled', 'true');
+    formData.append('latitude', document.getElementById('latitude').value);
+    formData.append('longitude', document.getElementById('longitude').value);
+    document.querySelectorAll('.release-input').forEach(input => {
+      formData.append(input.name, input.value);
+      const device = input.id.match(/\d+/)[0];
+      if (document.getElementById('device' + device + '_enabled').checked) {
+        formData.append('device' + device + '_enabled', 'true');
+      }
+    });
+
+    setButtonsDisabled(true);
+    showStatus('Saving schedule and location...', 'warning');
+    try {
+      const response = await fetch('/autochargerschedulesave', { method: 'POST', body: formData });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || 'Unable to save schedule and location');
+      showStatus(data.message, 'success');
+      await loadSettings(true);
+    } catch (error) {
+      showStatus(error.message, 'danger');
+    } finally {
+      setButtonsDisabled(false);
+    }
+  });
+
+  async function saveProfile(prefix) {
+    const inputs = Array.from(document.querySelectorAll('[id^="' + prefix + '_e"]'));
+    if (!validInputs(inputs)) return;
+
+    const formData = new FormData();
+    formData.append('profile', prefix);
+    inputs.forEach(input => formData.append(input.name, input.value));
+    const name = prefix === 'low' ? 'LowCharge' : 'FullCharge';
+    setButtonsDisabled(true);
+    showStatus('Saving ' + name + ' profile...', 'warning');
+    try {
+      const response = await fetch('/autochargerprofilesave', { method: 'POST', body: formData });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || 'Unable to save ' + name + ' profile');
+      showStatus(data.message, 'success');
+      await loadSettings(true);
+    } catch (error) {
+      showStatus(error.message, 'danger');
+    } finally {
+      setButtonsDisabled(false);
+    }
+  }
+
+  async function importCurrentProfile(prefix) {
+    const name = prefix === 'low' ? 'LowCharge' : 'FullCharge';
+    const device = profileSource.value;
+    setButtonsDisabled(true);
+    showStatus('Reading current settings from MPPT ' + device + '...', 'info');
+    try {
+      const response = await fetch('/mpptsettingsjson?device=' + encodeURIComponent(device), { cache: 'no-store' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.message || 'Unable to read current MPPT settings');
+      populateProfile(prefix, data.values, true);
+      showStatus('Current MPPT ' + device + ' settings imported into ' + name +
+        '. Press Save ' + name + ' Profile to store them.', 'success');
+    } catch (error) {
+      showStatus(error.message, 'danger');
+    } finally {
+      setButtonsDisabled(false);
+    }
+  }
+
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+  });
+  saveLowButton.addEventListener('click', () => saveProfile('low'));
+  saveFullButton.addEventListener('click', () => saveProfile('full'));
+  importLowButton.addEventListener('click', () => importCurrentProfile('low'));
+  importFullButton.addEventListener('click', () => importCurrentProfile('full'));
+
+  buildProfile('low', 'lowFields');
+  buildProfile('full', 'fullFields');
+  loadSettings(false);
+</script>
+%pre_foot_template%
+<p hidden></p>
