@@ -5,6 +5,7 @@
 
 #define EEPROM_SIZE 1024
 #define AUTO_CHARGER_SETTINGS_MAGIC 0xAC45
+#define AUTO_CHARGER_SAFETY_MAGIC 0xCB64
 #define AUTO_CHARGER_PROFILE_SIZE 15
 #define AUTO_CHARGER_MAX_DEVICES 6
 
@@ -50,6 +51,9 @@ public:
     uint8_t autoChargerReleasePercent[AUTO_CHARGER_MAX_DEVICES];
     uint8_t autoChargerLowProfileSet;
     uint8_t autoChargerFullProfileSet;
+    uint16_t autoChargerSafetyMagic;
+    bool autoChargerCircuitBreakerTripped;
+    int64_t autoChargerLimitStartTimestamp;
    } data;
 
   void load()
@@ -171,6 +175,10 @@ private:
     {
       initializeAutoCharger();
     }
+    if (data.autoChargerSafetyMagic != AUTO_CHARGER_SAFETY_MAGIC)
+    {
+      initializeAutoChargerSafety();
+    }
     if (!isfinite(data.autoChargerLatitude) || data.autoChargerLatitude < -90.0 || data.autoChargerLatitude > 90.0)
     {
       data.autoChargerLatitude = 0.0;
@@ -198,6 +206,14 @@ private:
     {
       data.autoChargerEnabled = false;
     }
+    if (data.autoChargerLimitStartTimestamp < -1)
+    {
+      initializeAutoChargerSafety();
+    }
+    if (data.autoChargerCircuitBreakerTripped)
+    {
+      data.autoChargerEnabled = false;
+    }
   }
   void initializeAutoCharger()
   {
@@ -215,6 +231,13 @@ private:
     {
       data.autoChargerReleasePercent[device] = 60;
     }
+    initializeAutoChargerSafety();
+  }
+  void initializeAutoChargerSafety()
+  {
+    data.autoChargerSafetyMagic = AUTO_CHARGER_SAFETY_MAGIC;
+    data.autoChargerCircuitBreakerTripped = false;
+    data.autoChargerLimitStartTimestamp = -1;
   }
   void coVersCheck()
   {
@@ -245,3 +268,5 @@ private:
     }
   }
 };
+
+static_assert(sizeof(Settings::Data) <= EEPROM_SIZE, "Settings::Data exceeds EEPROM_SIZE");

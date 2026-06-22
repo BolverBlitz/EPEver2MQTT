@@ -8,6 +8,7 @@
 <div id="coordinateWarning" class="alert alert-warning" role="alert" style="display:none">
   Latitude and longitude are required before sunrise, solar noon, sunset, or profile switch times can be calculated.
 </div>
+<div id="safetyStatus" class="alert alert-secondary" role="alert"></div>
 
 <form id="autoChargerForm">
   <div class="input-group mb-2">
@@ -182,6 +183,18 @@
     statusBox.textContent = message;
   }
 
+  function renderSafetyStatus(data) {
+    const box = document.getElementById('safetyStatus');
+    const highestAttempts = Math.max(0, ...data.devices.map(device => device.writeAttemptsToday));
+    box.className = 'alert alert-' + (data.circuitBreakerTripped ? 'danger' : 'secondary');
+    box.textContent = 'State: ' + data.state + '. Highest MPPT write count today: ' +
+      highestAttempts + '/' + data.maxWritesPerDay + '. Limit streak started: ' +
+      (data.limitStartTimestamp === -1 ? 'not active' : formatDate(data.limitStartTimestamp)) + '.';
+    if (data.circuitBreakerTripped) {
+      box.textContent += ' AUTO Charger was disabled automatically. Enable and save schedule to reset the breaker.';
+    }
+  }
+
   function formatTime(epoch) {
     if (!epoch) return '--:--';
     const date = new Date(epoch * 1000);
@@ -249,7 +262,8 @@
         'id="device' + device.device + '_release" name="device' + device.device + '_release" value="' + device.releasePercent + '">' +
         '<span class="input-group-text">%% through daylight</span></div>' +
         '<div class="small text-body-secondary mt-1">Release fraction: <span id="device' + device.device +
-        '_fraction">' + device.releaseFraction.toFixed(2) + '</span>; active profile: ' + device.activeProfile + '</div>';
+        '_fraction">' + device.releaseFraction.toFixed(2) + '</span>; active profile: ' + device.activeProfile +
+        '; writes today: ' + device.writeAttemptsToday + '/' + data.maxWritesPerDay + '</div>';
       target.appendChild(wrapper);
       wrapper.querySelector('.release-input').addEventListener('input', event => {
         const value = Number(event.target.value);
@@ -330,6 +344,7 @@
       document.getElementById('enabled').checked = data.enabled;
       document.getElementById('latitude').value = data.coordinatesSet ? data.latitude : '';
       document.getElementById('longitude').value = data.coordinatesSet ? data.longitude : '';
+      renderSafetyStatus(data);
       populateProfile('low', data.lowProfile, data.lowProfileSet);
       populateProfile('full', data.fullProfile, data.fullProfileSet);
       setProfileStatus('low', data.lowProfileSet);

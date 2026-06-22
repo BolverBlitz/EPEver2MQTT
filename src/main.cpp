@@ -70,6 +70,13 @@ enum AutoChargerProfile : uint8_t
 
 uint8_t autoChargerAppliedProfile[MAX_DEVICES] = {AUTO_PROFILE_UNKNOWN};
 unsigned long autoChargerLastAttempt[MAX_DEVICES] = {0};
+uint32_t autoChargerAttemptDay = 0;
+uint8_t autoChargerWriteAttempts[MAX_DEVICES] = {0};
+bool autoChargerLimitHitToday = false;
+const uint8_t AUTO_CHARGER_MAX_WRITES_PER_DAY = 7;
+const time_t AUTO_CHARGER_REPEAT_LIMIT_WINDOW = 21600;
+const time_t AUTO_CHARGER_LIMIT_WINDOW = 3 * 86400;
+const uint8_t AUTO_CHARGER_WRITE_LIMIT_REACHED = 0xE0;
 
 OneWire oneWire(TEMPSENS_PIN);
 DallasTemperature tempSens(&oneWire);
@@ -239,12 +246,107 @@ uint8_t writeMpptSettings(uint8_t device, const uint16_t *values)
   return epnode.writeMultipleRegisters(DEVICE_SETTINGS, DEVICE_SETTINGS_CNT);
 }
 
+const char *autoChargerState()
+{
+  if (_settings.data.autoChargerCircuitBreakerTripped)
+    return "CircuitBreaker";
+  return _settings.data.autoChargerEnabled ? "Enabled" : "Disabled";
+}
+
+bool prepareAutoChargerAttemptDay(time_t now)
+{
+  if (now < 1577836800)
+    return false;
+
+  time_t solarLocalNow =
+      now + (time_t)round(_settings.data.autoChargerLongitude * 240.0);
+  uint32_t day = (uint32_t)(solarLocalNow / 86400);
+  if (autoChargerAttemptDay == 0)
+  {
+    autoChargerAttemptDay = day;
+    if (_settings.data.autoChargerLimitStartTimestamp != -1)
+    {
+      time_t limitStartLocal =
+          (time_t)_settings.data.autoChargerLimitStartTimestamp +
+          (time_t)round(_settings.data.autoChargerLongitude * 240.0);
+      uint32_t limitStartDay = (uint32_t)(limitStartLocal / 86400);
+      if (limitStartDay + 1 < day)
+      {
+        _settings.data.autoChargerLimitStartTimestamp = -1;
+        _settings.save();
+      }
+    }
+  }
+  else if (autoChargerAttemptDay != day)
+  {
+    if (!autoChargerLimitHitToday || autoChargerAttemptDay + 1 < day)
+    {
+      if (_settings.data.autoChargerLimitStartTimestamp != -1)
+      {
+        _settings.data.autoChargerLimitStartTimestamp = -1;
+        _settings.save();
+      }
+    }
+    autoChargerAttemptDay = day;
+    memset(autoChargerWriteAttempts, 0, sizeof(autoChargerWriteAttempts));
+    autoChargerLimitHitToday = false;
+  }
+  return true;
+}
+
+uint8_t writeAutoChargerMpptSettings(uint8_t device, const uint16_t *values)
+{
+  time_t now;
+  time(&now);
+  uint8_t index = device - 1;
+  if (!prepareAutoChargerAttemptDay(now) ||
+      index >= MAX_DEVICES ||
+      autoChargerWriteAttempts[index] >= AUTO_CHARGER_MAX_WRITES_PER_DAY)
+    return AUTO_CHARGER_WRITE_LIMIT_REACHED;
+
+  autoChargerWriteAttempts[index]++;
+  if (autoChargerWriteAttempts[index] == AUTO_CHARGER_MAX_WRITES_PER_DAY &&
+      !autoChargerLimitHitToday)
+  {
+    autoChargerLimitHitToday = true;
+    if (_settings.data.autoChargerLimitStartTimestamp == -1)
+    {
+      _settings.data.autoChargerLimitStartTimestamp = (int64_t)now;
+      _settings.save();
+    }
+    else
+    {
+      int64_t limitAge = (int64_t)now - _settings.data.autoChargerLimitStartTimestamp;
+      if ((limitAge >= 0 && limitAge < (int64_t)AUTO_CHARGER_REPEAT_LIMIT_WINDOW) ||
+          limitAge > (int64_t)AUTO_CHARGER_LIMIT_WINDOW)
+      {
+        _settings.data.autoChargerCircuitBreakerTripped = true;
+        _settings.data.autoChargerEnabled = false;
+        _settings.save();
+        mqtttimer = 0;
+        DEBUG_WEBLN(limitAge < (int64_t)AUTO_CHARGER_REPEAT_LIMIT_WINDOW
+                        ? "AUTO CHARGER circuit breaker tripped after repeated limit hit within 1 hour"
+                        : "AUTO CHARGER circuit breaker tripped after daily write limit persisted over 3 days");
+      }
+    }
+  }
+  return writeMpptSettings(device, values);
+}
+
 uint8_t writeAndVerifyMpptSettings(uint8_t device, const uint16_t *values, uint16_t *readBack,
-                                   uint8_t &writeStatus, uint8_t &readStatus)
+                                   uint8_t &writeStatus, uint8_t &readStatus,
+                                   bool autoChargerControlled = false)
 {
   uint16_t previousTimeout = epnode.getResponseTimeout();
   epnode.setResponseTimeout(500);
-  writeStatus = writeMpptSettings(device, values);
+  writeStatus = autoChargerControlled
+                    ? writeAutoChargerMpptSettings(device, values)
+                    : writeMpptSettings(device, values);
+  if (writeStatus == AUTO_CHARGER_WRITE_LIMIT_REACHED)
+  {
+    epnode.setResponseTimeout(previousTimeout);
+    return 3;
+  }
   delay(200);
   readStatus = readMpptSettings(device, readBack);
 
@@ -257,7 +359,14 @@ uint8_t writeAndVerifyMpptSettings(uint8_t device, const uint16_t *values, uint1
   if (writeStatus == epnode.ku8MBResponseTimedOut || writeStatus == epnode.ku8MBInvalidCRC)
   {
     delay(250);
-    writeStatus = writeMpptSettings(device, values);
+    writeStatus = autoChargerControlled
+                      ? writeAutoChargerMpptSettings(device, values)
+                      : writeMpptSettings(device, values);
+    if (writeStatus == AUTO_CHARGER_WRITE_LIMIT_REACHED)
+    {
+      epnode.setResponseTimeout(previousTimeout);
+      return 3;
+    }
     delay(200);
     readStatus = readMpptSettings(device, readBack);
   }
@@ -494,12 +603,16 @@ void runAutoCharger()
   SolarTimes solar = calculateSolarTimes(now);
   if (!solar.valid)
     return;
+  if (!prepareAutoChargerAttemptDay(now))
+    return;
 
   const time_t lowChargeTime = solar.sunrise - 3600;
   for (uint8_t device = 1; device <= _settings.data.deviceQuantity && device <= MAX_DEVICES; device++)
   {
     uint8_t index = device - 1;
     if (!_settings.data.autoChargerMpptEnabled[index])
+      continue;
+    if (autoChargerWriteAttempts[index] >= AUTO_CHARGER_MAX_WRITES_PER_DAY)
       continue;
 
     time_t fullChargeTime =
@@ -532,7 +645,7 @@ void runAutoCharger()
     uint8_t writeStatus;
     uint8_t verifyReadStatus;
     uint8_t verifyStatus =
-        writeAndVerifyMpptSettings(device, profile, readBack, writeStatus, verifyReadStatus);
+        writeAndVerifyMpptSettings(device, profile, readBack, writeStatus, verifyReadStatus, true);
     if (verifyStatus == 0)
     {
       autoChargerAppliedProfile[index] = desiredProfile;
@@ -545,6 +658,8 @@ void runAutoCharger()
     {
       DEBUG_WEBLN("AUTO CHARGER device " + String(device) + " profile write failed");
     }
+    if (_settings.data.autoChargerCircuitBreakerTripped)
+      return;
   }
 }
 
@@ -725,6 +840,11 @@ void setup()
                 if(strlen(_settings.data.httpUser) > 0 && !request->authenticate(_settings.data.httpUser, _settings.data.httpPass)) return request->requestAuthentication();
                 JsonDocument document;
                 document["enabled"] = _settings.data.autoChargerEnabled;
+                document["state"] = autoChargerState();
+                document["circuitBreakerTripped"] = _settings.data.autoChargerCircuitBreakerTripped;
+                document["maxWritesPerDay"] = AUTO_CHARGER_MAX_WRITES_PER_DAY;
+                document["limitStartTimestamp"] = _settings.data.autoChargerLimitStartTimestamp;
+                document["limitWindowDays"] = AUTO_CHARGER_LIMIT_WINDOW / 86400;
                 document["coordinatesSet"] = _settings.data.autoChargerCoordinatesSet;
                 document["lowProfileSet"] = _settings.data.autoChargerLowProfileSet == 1;
                 document["fullProfileSet"] = _settings.data.autoChargerFullProfileSet == 1;
@@ -747,6 +867,7 @@ void setup()
                   JsonObject deviceData = devices.add<JsonObject>();
                   deviceData["device"] = device;
                   deviceData["enabled"] = _settings.data.autoChargerMpptEnabled[index];
+                  deviceData["writeAttemptsToday"] = autoChargerWriteAttempts[index];
                   deviceData["releasePercent"] = _settings.data.autoChargerReleasePercent[index];
                   deviceData["releaseFraction"] =
                       _settings.data.autoChargerReleasePercent[index] / 100.f;
@@ -836,6 +957,11 @@ void setup()
                   return;
                 }
 
+                if (autoEnabled && !_settings.data.autoChargerEnabled)
+                {
+                  _settings.data.autoChargerCircuitBreakerTripped = false;
+                  _settings.data.autoChargerLimitStartTimestamp = -1;
+                }
                 _settings.data.autoChargerEnabled = autoEnabled;
                 _settings.data.autoChargerCoordinatesSet = true;
                 _settings.data.autoChargerLatitude = latitude;
@@ -1312,6 +1438,7 @@ bool epWorker()
   }
   liveJson["Wifi_RSSI"] = WiFi.RSSI();
   runAutoCharger();
+  liveJson["AutoCharger"] = autoChargerState();
 
   if (strlen(_settings.data.NTPTimezone) != 0 && setNTPTimeToDevice == true)
   {
@@ -1618,6 +1745,7 @@ bool getJsonData(int invNum)
   liveJson["ESP_VCC"] = (ESP.getVcc() / 1000.0) + 0.3;
   liveJson["Runtime"] = millis() / 1000;
   liveJson["Wifi_RSSI"] = WiFi.RSSI();
+  liveJson["AutoCharger"] = autoChargerState();
   liveJson["sw_version"] = SOFTWARE_VERSION;
 
   for (int i = 0; i < numOfTempSens; i++)
@@ -1637,6 +1765,7 @@ bool connectMQTT()
     if (mqttclient.connect(mqttClientId, _settings.data.mqttUser, _settings.data.mqttPassword, (topic + "/Alive").c_str(), 0, true, "false", true))
     {
       mqttclient.publish((topic + String("/IP")).c_str(), String(WiFi.localIP().toString()).c_str(), true);
+      mqttclient.publish((topic + String("/AutoCharger")).c_str(), autoChargerState(), true);
       mqttclient.publish((topic + String("/Alive")).c_str(), "true", true); // LWT online message must be retained!
 
       if (strlen(_settings.data.mqttTriggerPath) > 0)
@@ -1676,6 +1805,7 @@ bool sendtoMQTT()
   }
   mqttclient.publish((topic + String("/Alive")).c_str(), "true", true);
   mqttclient.publish((topic + String("/Wifi_RSSI")).c_str(), String(WiFi.RSSI()).c_str());
+  mqttclient.publish((topic + String("/AutoCharger")).c_str(), autoChargerState(), true);
   if (!_settings.data.mqttJson)
   {
     for (JsonPair jsonDev : liveJson.as<JsonObject>())
@@ -1915,6 +2045,25 @@ bool sendHaDiscovery()
       haPayLoad += haDeviceDescription;
       haPayLoad += "}";
       sprintf(topBuff, "homeassistant/sensor/%s_%s/%s/config", _settings.data.mqttTopic, jsonDev.key().c_str(), "IP"); // build the topic
+      mqttclient.beginPublish(topBuff, haPayLoad.length(), true);
+      for (size_t i = 0; i < haPayLoad.length(); i++)
+      {
+        mqttclient.write(haPayLoad[i]);
+      }
+      mqttclient.endPublish();
+
+      // AUTO Charger
+      haPayLoad = String("{") +
+                  "\"name\":\"AutoCharger\"," +
+                  "\"stat_t\":\"" + _settings.data.mqttTopic + "/AutoCharger\"," +
+                  "\"avty_t\":\"" + _settings.data.mqttTopic + "/Alive\"," +
+                  "\"pl_avail\": \"true\"," +
+                  "\"pl_not_avail\": \"false\"," +
+                  "\"uniq_id\":\"" + mqttClientId + ".AutoCharger_" + jsonDev.key().c_str() + "\"," +
+                  "\"ic\":\"mdi:solar-power-variant\",";
+      haPayLoad += haDeviceDescription;
+      haPayLoad += "}";
+      sprintf(topBuff, "homeassistant/sensor/%s_%s/%s/config", _settings.data.mqttTopic, jsonDev.key().c_str(), "AutoCharger");
       mqttclient.beginPublish(topBuff, haPayLoad.length(), true);
       for (size_t i = 0; i < haPayLoad.length(); i++)
       {
