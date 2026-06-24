@@ -1,3 +1,7 @@
+DO NOT USE THIS BRANCH AS IT WILL DAMAGE YOUR MPPT! (Kills Flash within a Month worst case)  
+However, there seem to be other registers that are undocumented and used by PAL-ADP-50AN. I have orderd one and will sniff the com.
+
+
 # EPEver2MQTT  [![GitHub release](https://img.shields.io/github/release/softwarecrash/EPEver2MQTT?include_prereleases=&sort=semver&color=blue)](https://github.com/softwarecrash/EPEver2MQTT/releases/latest) [![Discord](https://img.shields.io/discord/1007020337482973254?logo=discord&label=Discord)](https://discord.gg/Hup3gg4YsN)
 ESP82XX to MQTT based connector for EPEver Solar tracker, support multiple trackers
 
